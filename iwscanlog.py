@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+@author: Adrien Demarez
 Small tool to log Wifi APs and their center frequency and bandwidth from various sources (iwlist, iw, adb)
 """
 
@@ -11,6 +13,7 @@ import sys,os
 import re
 from time import time, sleep
 import json
+import argparse
 
 def adb_gps():
     res = os.popen("adb shell dumpsys location").read()
@@ -26,12 +29,14 @@ def adb_gps():
     lat= float(pos2[1])
     return lon, lat
 
-def geodf(df):
-    lon,lat = adb_gps()
+def geodf(df, lon=None, lat=None):
+    if df is None: return None
+    if lon is None or lat is None:
+        lon,lat = adb_gps()
     df['lon'] = lon ; df['lat'] = lat
     return gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat), crs=4326)
 
-def adb_scan_wifi():
+def adb_scan():
     #adb service list
     #https://gist.github.com/nstarke/615ca3603fdded8aee47fab6f4917826
     #https://android.stackexchange.com/questions/225260/termux-running-termux-via-adb-without-any-direct-interaction-with-the-device
@@ -232,9 +237,31 @@ def store(df, dbfilename="wlans.db"):
     return df1, df2
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--iw", "-i", help="Internal scan", action='store_true', default=False)
+    parser.add_argument("--ssh", "-s", help="SSH scan through router", action='store_true', default=False)
+    parser.add_argument("--adb", "-a", help="ADB scan through smartphone", action='store_true', default=False)
+    parser.add_argument("--gps", "-g", help="GPS log through smartphone", action='store_true', default=False)
+    parser.add_argument("--db", "-d", help="Log in SQLite DB", default=None)
+    parser.add_argument("--print", "-p", help="Print on console", action='store_true', default=True)
+    args = parser.parse_args()
+
     while (True):
-        print('\033[2J')
-        df = scanall()
-        if df is None:
-            continue
+        if args.print:
+            print('\033[2J')
+        if args.gps:
+            lon,lat = adb_gps()
+        if args.iw:
+            df_iw = parse_iw_scan(iw_scan())
+            if args.print: print(df_iw)
+            if args.gps: df_iw=geodf(df_iw, lon, lat)
+        if args.ssh:
+            df_ssh = parse_iwlist_scan(get_ubnt_wlans())
+            if args.print: print(df_ssh)
+            if args.gps: df_ssh=geodf(df_ssh, lon, lat)
+        if args.adb:
+            df_adb = adb_scan()
+            if args.print: print(df_adb)
+            if args.adb: df_iw=geodf(df_adb, lon, lat)
+
         sleep(10)
