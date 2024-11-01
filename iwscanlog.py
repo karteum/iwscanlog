@@ -153,8 +153,8 @@ def parse_iw_scan(wlanstr, iface="wlo1", mtime=None):
             net["Fc"] = net["freq_20"]
             net["Channel"] = net["channel_20"]
     df = pd.DataFrame(wlans)
-    df["fmin"] = df.Fc- df.chanbw/2
-    df["fmax"] = df.Fc+ df.chanbw/2
+    df["fmin"] = df.Fc - df.chanbw//2
+    df["fmax"] = df.Fc + df.chanbw//2
     df['Time'] = int(time()) if mtime is None else mtime
     df.set_index("ID", inplace=True)
     return df
@@ -203,8 +203,8 @@ def parse_iwlist_scan(wlans, mtime=None):
     df['Time'] = int(time()) if mtime is None else mtime
     if not "Channel" in df.columns:
         df["Channel"] = None
-    df["fmin"] = df.center1 - df.chanbw/2
-    df["fmax"] = df.center1 + df.chanbw/2
+    df["fmin"] = df.center1 - df.chanbw//2
+    df["fmax"] = df.center1 + df.chanbw//2
     df.rename(columns={"center1": "Fc", "ESSID": "SSID", "Frequency": "freq_20", "Channel": "channel_20"}, inplace=True)
     #df2 = df[['MAC', 'Fc', 'chanbw', 'fmin', 'fmax', 'Time', 'Signal', 'SSID', 'Country', 'Environment', 'Channels', 'channel_20', 'freq_20', 'freq_40', 'channel_40', 'freq_VHT', 'channel_VHT']].copy()
     #df.Channel = df.Channel.astype(pd.Int16Dtype())
@@ -247,21 +247,21 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     while (True):
-        if args.print:
-            print('\033[2J')
         if args.gps:
             lon,lat = adb_gps()
         if args.iw:
             df_iw = parse_iw_scan(iw_scan())
-            if args.print: print(df_iw)
             if args.gps: df_iw=geodf(df_iw, lon, lat)
         if args.ssh:
             df_ssh = parse_iwlist_scan(get_ubnt_wlans())
-            if args.print: print(df_ssh)
             if args.gps: df_ssh=geodf(df_ssh, lon, lat)
         if args.adb:
             df_adb = adb_scan()
-            if args.print: print(df_adb)
-            if args.adb: df_iw=geodf(df_adb, lon, lat)
-
+            if args.gps: df_adb=geodf(df_adb, lon, lat)
+        if args.print:
+            #print('\033[2J')
+            print('_______________________________\n')
+            if args.iw: print(df_iw)
+            if args.ssh: print(df_ssh)
+            if args.adb: print(df_adb)
         sleep(10)
