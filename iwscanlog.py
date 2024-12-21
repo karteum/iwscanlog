@@ -6,17 +6,37 @@ Small tool to log Wifi APs and their center frequency and bandwidth from various
 """
 
 import pandas as pd
-import geopandas as gpd
 import sqlite3
 import numpy as np
-import sys,os
 import re
 from time import time, sleep
 import json
 import argparse
 
+from signal import signal,SIGINT,SIG_IGN
+import subprocess
+
+class DelayedKeyboardInterrupt:
+    def __enter__(self):
+        self.signal_received = False
+        self.old_handler = signal(SIGINT, self.handler)
+
+    def handler(self, sig, frame):
+        self.signal_received = (sig, frame)
+
+    def __exit__(self, type, value, traceback):
+        signal(SIGINT, self.old_handler)
+        if self.signal_received:
+            self.old_handler(*self.signal_received)
+
+def cmd(mycmd):
+    """Launches a subcommand while ignoring SIGINT"""
+    #res= os.popen(mycmd).read()
+    res = subprocess.run(mycmd.split(), capture_output=True, text=True, preexec_fn=lambda: signal(SIGINT, SIG_IGN))
+    return res.stdout
+
 def adb_gps():
-    res = os.popen("adb shell dumpsys location").read()
+    res = cmd("adb shell dumpsys location")
     if res=='':
         #raise Exception("ADB_unavailable")
         return None, None
@@ -30,6 +50,7 @@ def adb_gps():
     return lon, lat
 
 def geodf(df, lon=None, lat=None):
+    import geopandas as gpd
     if df is None: return None
     if lon is None or lat is None:
         lon,lat = adb_gps()
@@ -42,7 +63,7 @@ def adb_scan():
     #https://android.stackexchange.com/questions/225260/termux-running-termux-via-adb-without-any-direct-interaction-with-the-device
     #run-as com.termux files/usr/bin/bash -lic 'export PATH=/data/data/com.termux/files/usr/bin:$PATH; export LD_PRELOAD=/data/data/com.termux/files/usr/lib/libtermux-exec.so; bash -i'
     # prerequisites: 1°/ a debug version of Termux and Termux-API (e.g. from Github releases, not from Play Store or F-Droid), and 2°/ pkg install termux-api
-    res = os.popen("adb shell run-as com.termux files/usr/bin/termux-wifi-scaninfo").read()
+    res = cmd("adb shell run-as com.termux files/usr/bin/termux-wifi-scaninfo")
     return pd.DataFrame(json.loads(res))
 
 def wifi_channel_plan():
@@ -70,11 +91,11 @@ def wifi_channel_plan():
 
 def iw_scan(iface="wlo1"):
     # Preliminary requirement: sudo setcap 'CAP_NET_ADMIN=ep' /usr/bin/iw
-    #os.system("/sbin/iw dev wlo1 scan flush")
-    wlans = os.popen(f'/sbin/iw {iface} scan').read()
+    #cmd("/sbin/iw dev wlo1 scan flush")
+    wlans = cmd(f'/sbin/iw {iface} scan')
     return wlans
 
-def parse_iw_scan(wlanstr, iface="wlo1", mtime=None):
+def parse_iw_scan(wlanstr, iface="wlo1"):
     # FIXME: in a future version, use directly RTNETLINK since iw --help says "Do NOT screenscrape this tool, we don't consider its output stable"
     # Developed and tested on Debian Bookworm
     # FIXME: how to get channel quality (not just signal level) ?
@@ -155,17 +176,16 @@ def parse_iw_scan(wlanstr, iface="wlo1", mtime=None):
     df = pd.DataFrame(wlans)
     df["fmin"] = df.Fc - df.chanbw//2
     df["fmax"] = df.Fc + df.chanbw//2
-    df['Time'] = int(time()) if mtime is None else mtime
     df.set_index("ID", inplace=True)
     return df
 
 from pathlib import Path
 def get_ubnt_wlans(username):
-    cmd = f'''ssh -oHostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=ssh-rsa -i {Path.home()}/.ssh/id_rsa {username}@192.168.1.20 "iwlist ath0 scan"''' # -legacy ?
-    wlans = os.popen(cmd).read()
+    mycmd = f'''ssh -oHostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=ssh-rsa -i {Path.home()}/.ssh/id_rsa {username}@192.168.1.20 "iwlist ath0 scan"''' # -legacy ?
+    wlans = cmd(mycmd)
     return wlans
 
-def parse_iwlist_scan(wlans, mtime=None):
+def parse_iwlist_scan(wlans):
     wlans = re.sub('\n +', '\n', wlans)
     wlans = re.sub('\n.* - Address:', '\nAddress:', wlans)
     wlans = wlans.replace("Extra:", "").replace(" level", "").replace("=", ":").replace("(Channel", "\nChannel:") \
@@ -200,7 +220,6 @@ def parse_iwlist_scan(wlans, mtime=None):
         return None
     df = pd.DataFrame(wlan_nets)
     df.set_index("ID", inplace=True)
-    df['Time'] = int(time()) if mtime is None else mtime
     if not "Channel" in df.columns:
         df["Channel"] = None
     df["fmin"] = df.center1 - df.chanbw//2
@@ -217,51 +236,110 @@ def filter_mto(nets):
     idx = np.logical_and(nets.fmin<MTO_MAX, nets.fmax>MTO_MIN)
     return nets[idx]
 
-def store(df, dbfilename="wlans.db"):
-    df_static_fields = ["MAC", "ESSID", "fmin","fmax","Frequency", "ieee_mode", "center1", "chanbw", "Channel"]
-    df_dyn_fields = ["Signal", "Quality", "Noise", "Time"]
-    df1 = df[df_static_fields]
+def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None):
+    if len(df)==0:
+        return None, None
+    if 'Time' in df.columns:
+        df.rename(columns={"Time": "time"}, inplace=True)
+    if 'time' in df.columns:
+        t = df.time.min()
+    else:
+        t = int(time())
+        df["time"] = t
+    if not azimuth in df.columns: df['azimuth'] = azimuth
+    if not lon in df.columns: df['lon'] = lon
+    if not lat in df.columns: df['lat'] = lat
+    df_static_fields = ["MAC", "SSID", "fmin", "fmax", "Fc", "chanbw", "channel_20"] #"ieee_mode", "center1",
+    df_dyn_fields = ["Signal", "time", "lon", "lat", "azimuth"] # "Quality", "Noise",
+    for field in df_static_fields+df_dyn_fields:
+        if not field in df.columns:
+            df[field] = None
+    df1 = df[df_static_fields].drop_duplicates()
     df2 = df[df_dyn_fields]
+    #df3 = pd.DataFrame({"time": [t], "lon": lon, "lat": lat, "azimuth": azimuth})
+
     conn = sqlite3.connect(dbfilename)
     try:
         df1_existing = pd.read_sql("select * from networks", conn)
-        df1_existing.set_index('Address', inplace=True)
+        for field in df_static_fields:
+            if not field in df1_existing.columns:
+                df1_existing[field] = None
+        df1_existing.set_index('ID', inplace=True)
         #df1_final = pd.merge(df1_existing, df1, how='outer"')
-        df1_final = pd.concat([df1_existing, df1]).drop_duplicates()
+        #df1_final = pd.concat([df1_existing, df1]).drop_duplicates(keep=False)
+        cond = df1.index.isin(df1_existing.index)
+        df1_final = df1.drop(df1[cond].index)
     except:
         df1_final = df1
         print("create table")
-    df1_final.to_sql('networks', conn, if_exists='replace', dtype={'Address': 'INTEGER PRIMARY KEY AUTOINCREMENT'}) # replace is for whole table, not per record
+    df1_final.to_sql('networks', conn, if_exists='append', dtype={'ID': 'INTEGER PRIMARY KEY'}) # replace is for whole table, not per record
     df2.to_sql('measurements', conn, if_exists='append')
-    df1_final.to_excel(dbfilename + ".xlsx")
+    #df3.to_sql("sessions", conn, if_exists='append')
+    #df1_final.to_excel(dbfilename + ".xlsx")
     return df1, df2
+
+def mergedb(db_dest, db2, azimuth=None):
+    conn = sqlite3.connect(db2)
+    df1 = pd.read_sql("select * from networks", conn)
+    df1.set_index('ID', inplace=True)
+    df2 = pd.read_sql("select * from measurements", conn)
+    df2.set_index('ID', inplace=True)
+    df_final = df1.merge(df2, left_index=True, right_index=True)
+    store(df_final, db_dest, azimuth=azimuth)
+    #try: df3 = pd.read_sql("select * from sessions", conn)
+    #except: df3=None
+    #if (df3 is None or not any(df3.azimuth)) and azimuth is not None:
+    #    print("foo")
+    #return df1, df2
+
+#def mergedb(db1, db2):
+#    print((db1, db2))
+#    conn = sqlite3.connect(db1)
+#    cur = conn.cursor()
+#    cur.executescript(f"""attach database '{db2}' as otherdb;
+#                          insert or replace into networks select * from otherdb.networks""")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument("--azimuth", "-a", help="Azimuth", default=None)
     parser.add_argument("--iw", "-i", help="Internal scan", action='store_true', default=False)
-    parser.add_argument("--ssh", "-s", help="SSH scan through router", action='store_true', default=False)
-    parser.add_argument("--adb", "-a", help="ADB scan through smartphone", action='store_true', default=False)
+    parser.add_argument("--sshuser", "-s", help="SSH username for scanning through router", default=None)
+    parser.add_argument("--adb", "-b", help="ADB scan through smartphone", action='store_true', default=False)
     parser.add_argument("--gps", "-g", help="GPS log through smartphone", action='store_true', default=False)
     parser.add_argument("--db", "-d", help="Log in SQLite DB", default=None)
     parser.add_argument("--print", "-p", help="Print on console", action='store_true', default=True)
+    parser.add_argument("--num_iterations", "-n", help="Number of iterations", default=1<<24)
+    parser.add_argument("--mergedb", "-m", help="Merge with other DB", default=None)
     args = parser.parse_args()
+    n = args.num_iterations
+    with DelayedKeyboardInterrupt():
+        if args.mergedb is not None and args.db is not None:
+            mergedb(args.db, args.mergedb)
+            exit(0)
 
-    while (True):
-        if args.gps:
-            lon,lat = adb_gps()
-        if args.iw:
-            df_iw = parse_iw_scan(iw_scan())
-            if args.gps: df_iw=geodf(df_iw, lon, lat)
-        if args.ssh:
-            df_ssh = parse_iwlist_scan(get_ubnt_wlans())
-            if args.gps: df_ssh=geodf(df_ssh, lon, lat)
-        if args.adb:
-            df_adb = adb_scan()
-            if args.gps: df_adb=geodf(df_adb, lon, lat)
-        if args.print:
-            #print('\033[2J')
-            print('_______________________________\n')
-            if args.iw: print(df_iw)
-            if args.ssh: print(df_ssh)
-            if args.adb: print(df_adb)
+    while (n>0):
+        with DelayedKeyboardInterrupt():
+            if args.gps:
+                lon,lat = adb_gps()
+            if args.azimuth is not None:
+                pass
+            if args.iw:
+                df_iw = parse_iw_scan(iw_scan())
+                if args.gps: df_iw=geodf(df_iw, lon, lat)
+                if args.db: store(df_iw, args.db, azimuth=args.azimuth)
+            if args.sshuser is not None:
+                df_ssh = parse_iwlist_scan(get_ubnt_wlans(args.sshuser))
+                if args.gps: df_ssh=geodf(df_ssh, lon, lat)
+                if args.db: store(df_ssh, args.db, azimuth=args.azimuth)
+            if args.adb:
+                df_adb = adb_scan()
+                if args.gps: df_adb=geodf(df_adb, lon, lat)
+                if args.db: store(df_adb, args.db, azimuth=args.azimuth)
+            if args.print:
+                #print('\033[2J')
+                print('_______________________________\n')
+                if args.iw: print(df_iw)
+                if args.sshuser: print(df_ssh)
+                if args.adb: print(df_adb)
         sleep(10)
+        n -= 1
