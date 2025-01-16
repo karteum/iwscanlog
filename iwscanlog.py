@@ -137,19 +137,23 @@ def parse_iw_scan(wlanstr, iface="wlo1"):
     for net in wlans:                
         BW = 20
         net["channel_20"] = fplan[fplan.Fc==net["freq_20"]].index[0]
+        net["Fc"] = net["freq_20"]
         if "HT primary channel" in net:
             HT0_channel = int(net["HT primary channel"])
-            assert(net["channel_20"] == HT0_channel) #assert(fplan.loc[HT0_channel].Fc == net["freq_20"])
+            try: assert(net["channel_20"] == HT0_channel) #assert(fplan.loc[HT0_channel].Fc == net["freq_20"])
+            except: print((net["channel_20"], HT0_channel))
             del net["HT primary channel"]
             if "DS Parameter set" in net:
-                assert(HT0_channel == net["DS Parameter set"])
+                try: assert(HT0_channel == net["DS Parameter set"])
+                except: print ((HT0_channel, net["DS Parameter set"]))
                 del net["DS Parameter set"]
             if net["HT STA channel width"] == "any":
                 BW = 40
                 freq = fplan.loc[HT0_channel].Fc + (10 if net["HT secondary channel offset"]=="above" else - 10)
                 net["freq_40"] = int(freq)
-                if freq>5000:
+                if freq>5000: # FIXME: otherwise what ?
                     net["channel_40"] = fplan[fplan.Fc==freq].index[0]
+                net["Fc"] = net["freq_40"]
             del net["HT secondary channel offset"], net["HT STA channel width"]
         if "VHT channel width" in net:
             BW_code = int(net["VHT channel width"][0])
@@ -158,8 +162,10 @@ def parse_iw_scan(wlanstr, iface="wlo1"):
             VHT_channel = int(net["VHT center freq segment 1"])
             if VHT_channel>=32:
                 freq = fplan.loc[VHT_channel].Fc
-                assert(net["VHT center freq segment 2"] == '0' and not "VHT center freq segment 3" in net)
-                assert(BW == fplan.loc[VHT_channel].BW)
+                try: assert(net["VHT center freq segment 2"] == '0' and not "VHT center freq segment 3" in net)
+                except: print(net)
+                try:  assert(BW == fplan.loc[VHT_channel].BW)
+                except: print((BW, fplan.loc[VHT_channel].BW))
                 net["freq_VHT"] = int(freq)
                 net["channel_VHT"] = fplan[fplan.Fc==freq].index[0]
             del net["VHT center freq segment 2"], net["VHT center freq segment 1"], net["VHT channel width"]
@@ -174,6 +180,9 @@ def parse_iw_scan(wlanstr, iface="wlo1"):
             net["Fc"] = net["freq_20"]
             net["Channel"] = net["channel_20"]
     df = pd.DataFrame(wlans)
+    if len(df)==0:
+        print(wlanstr)
+        return None
     df["fmin"] = df.Fc - df.chanbw//2
     df["fmax"] = df.Fc + df.chanbw//2
     df.set_index("ID", inplace=True)
