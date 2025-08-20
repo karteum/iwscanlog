@@ -15,6 +15,11 @@ import argparse
 
 from signal import signal,SIGINT,SIG_IGN
 import subprocess
+from serial import Serial
+from pynmeagps import NMEAReader
+from pathlib import Path
+def dbgprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
 class DelayedKeyboardInterrupt:
     def __enter__(self):
@@ -29,11 +34,17 @@ class DelayedKeyboardInterrupt:
         if self.signal_received:
             self.old_handler(*self.signal_received)
 
-def cmd(mycmd):
+import os
+def cmd(mycmd, mode=None): # FIXME: issue popen/subprocess iw/iwlist
     """Launches a subcommand while ignoring SIGINT"""
-    #res= os.popen(mycmd).read()
-    res = subprocess.run(mycmd.split(), capture_output=True, text=True, preexec_fn=lambda: signal(SIGINT, SIG_IGN))
-    return res.stdout
+    if mode=="popen":
+        res= os.popen(mycmd).read()
+        #print(mycmd)
+    else:
+        res1 = subprocess.run(mycmd.split(), capture_output=True, text=True, preexec_fn=lambda: signal(SIGINT, SIG_IGN))
+        res = res1.stdout
+        #print(res)
+    return res
 
 def adb_gps():
     res = cmd("adb shell dumpsys location")
@@ -49,11 +60,19 @@ def adb_gps():
     lat= float(pos2[1])
     return lon, lat
 
+def nmea_gps():
+    with Serial('/dev/ttyUSB0', 4800, timeout=3) as stream:
+        nmr = NMEAReader(stream)
+        parsed_data = None
+        while not(parsed_data is not None and hasattr(parsed_data,'lat') and hasattr(parsed_data,"lon")):
+            raw_data, parsed_data = nmr.read()
+            #print(parsed_data)
+        return parsed_data.lon, parsed_data.lat
+
 def geodf(df, lon=None, lat=None):
-    import geopandas as gpd
     if df is None: return None
     if lon is None or lat is None:
-        lon,lat = adb_gps()
+        return df
     df['lon'] = lon ; df['lat'] = lat
     return gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat), crs=4326)
 
@@ -66,20 +85,20 @@ def adb_scan():
     res = cmd("adb shell run-as com.termux files/usr/bin/termux-wifi-scaninfo")
     return pd.DataFrame(json.loads(res))
 
-def wifi_channel_plan():
+def wifi_channel_plan(): # FIXME: alert when channel out of range
     df0 = pd.DataFrame({'channel': np.arange(1, 14+1)})
     df0['Fc'] = 2412 + (df0.channel-1) * 5
     df0['BW'] = 20
-    df1 = pd.DataFrame({'channel': np.arange(32, 144+1, 4)})
+    df1 = pd.DataFrame({'channel': np.append(np.arange(32, 144+1, 4), np.arange(149, 177+1, 4))})
     df1['Fc'] = 5160 + (df1.channel - 32) * 5
     df1['BW'] = 20
-    df2 = pd.DataFrame({'channel': np.arange(38, 142+1, 8)})
+    df2 = pd.DataFrame({'channel': np.append(np.arange(38, 142+1, 8), np.arange(151, 175+1, 8))})
     df2['Fc'] = 5190 + (df2.channel - 38) * 5
     df2['BW'] = 40
-    df3 = pd.DataFrame({'channel': np.arange(42, 138+1, 16)})
+    df3 = pd.DataFrame({'channel': np.append(np.arange(42, 138+1, 16), np.arange(155, 171+1, 16))})
     df3['Fc'] = 5210 + (df3.channel - 42) * 5
     df3['BW'] = 80
-    df4 = pd.DataFrame({'channel': np.arange(50, 114+1, 32)})
+    df4 = pd.DataFrame({'channel': np.append(np.arange(50, 114+1, 32), 163)})
     df4['Fc'] = 5250 + (df4.channel - 50) * 5
     df4['BW'] = 160
     df = pd.concat([df0, df1, df2, df3, df4])
@@ -89,13 +108,14 @@ def wifi_channel_plan():
     df.set_index("channel", inplace=True)
     return df
 
-def iw_scan(iface="wlo1"):
-    # Preliminary requirement: sudo setcap 'CAP_NET_ADMIN=ep' /usr/bin/iw
+def iw_scan(iface=None):
+    # Preliminary requirement: sudo setcap 'CAP_NET_ADMIN=ep' /sbin/iw
     #cmd("/sbin/iw dev wlo1 scan flush")
-    wlans = cmd(f'/sbin/iw {iface} scan')
+    if iface is None: iface="wlo1"
+    wlans = cmd(f'/sbin/iw {iface} scan flush')
     return wlans
 
-def parse_iw_scan(wlanstr, iface="wlo1"):
+def parse_iw_scan(wlanstr):
     # FIXME: in a future version, use directly RTNETLINK since iw --help says "Do NOT screenscrape this tool, we don't consider its output stable"
     # Developed and tested on Debian Bookworm
     # FIXME: how to get channel quality (not just signal level) ?
@@ -104,10 +124,9 @@ def parse_iw_scan(wlanstr, iface="wlo1"):
     fplan = wifi_channel_plan()
     for line in wlanstr.splitlines():
         line = line.replace("\t", "").rstrip()
-        if line.startswith("BSS ") and (line.endswith(f'(on {iface})') or line.endswith("-- associated")):
+        if line.startswith("BSS ") and "(on " in line: #and (line.endswith(f'(on {iface})') or line.endswith("-- associated")):
             wlans.append({"MAC": line[4:21]}) #mac = line.replace("BSS ", "").replace(f'(on {iface})', '').replace(" -- associated","")
-            v_int=int(line[4:21].replace(':',''), 16)
-            wlans[-1]["ID"] = v_int
+            wlans[-1]["ID"] = int(line[4:21].replace(':',''), 16)
         elif line.startswith("freq: "):
             wlans[-1]["freq_20"] = int(float(line[6:])) #.replace("freq: ", "")
         elif line.startswith("signal: "):
@@ -138,57 +157,79 @@ def parse_iw_scan(wlanstr, iface="wlo1"):
         BW = 20
         net["channel_20"] = fplan[fplan.Fc==net["freq_20"]].index[0]
         net["Fc"] = net["freq_20"]
+        net2=net.copy()
+        del net2["Signal"]
+        net["dbg"] = str(net2)
+        del net2
         if "HT primary channel" in net:
             HT0_channel = int(net["HT primary channel"])
-            try: assert(net["channel_20"] == HT0_channel) #assert(fplan.loc[HT0_channel].Fc == net["freq_20"])
-            except: print((net["channel_20"], HT0_channel))
-            del net["HT primary channel"]
-            if "DS Parameter set" in net:
-                try: assert(HT0_channel == net["DS Parameter set"])
-                except: print ((HT0_channel, net["DS Parameter set"]))
-                del net["DS Parameter set"]
-            if net["HT STA channel width"] == "any":
-                BW = 40
-                freq = fplan.loc[HT0_channel].Fc + (10 if net["HT secondary channel offset"]=="above" else - 10)
-                net["freq_40"] = int(freq)
-                if freq>5000: # FIXME: otherwise what ?
-                    net["channel_40"] = fplan[fplan.Fc==freq].index[0]
-                net["Fc"] = net["freq_40"]
-            del net["HT secondary channel offset"], net["HT STA channel width"]
-        if "VHT channel width" in net:
+            if HT0_channel in fplan.index:
+                try: assert(net["channel_20"] == HT0_channel) #assert(fplan.loc[HT0_channel].Fc == net["freq_20"])
+                except: dbgprint(f'assert(net["channel_20"] == HT0_channel) : {net}')
+                del net["HT primary channel"]
+                if "DS Parameter set" in net:
+                    try: assert(HT0_channel == net["DS Parameter set"])
+                    except: dbgprint(f'Error assert(HT0_channel == net["DS Parameter set"]) : {net}')
+                    del net["DS Parameter set"]
+                if net["HT STA channel width"] == "any":
+                    BW = 40
+                    freq = fplan.loc[HT0_channel].Fc + (10 if net["HT secondary channel offset"]=="above" else - 10)
+                    net["freq_40"] = int(freq)
+                    #if freq>5000: # FIXME: otherwise what ?
+                    #    try: net["channel_40"] = fplan[fplan.Fc==freq].index[0]
+                    #    except: dbgprint(f'Error fplan[fplan.Fc==freq].index[0] : {net}')
+                    net["Fc"] = net["freq_40"]
+                del net["HT secondary channel offset"], net["HT STA channel width"]
+            else: dbgprint(f'Error fplan.loc[HT0_channel] : {net}')
+
+        if "VHT channel width" in net and "VHT center freq segment 1" in net:
             BW_code = int(net["VHT channel width"][0])
-            if BW_code==1: BW=80
-            elif BW_code>1: BW=160
             VHT_channel = int(net["VHT center freq segment 1"])
-            if VHT_channel>=32:
-                freq = fplan.loc[VHT_channel].Fc
-                try: assert(net["VHT center freq segment 2"] == '0' and not "VHT center freq segment 3" in net)
-                except: print(net)
-                try:  assert(BW == fplan.loc[VHT_channel].BW)
-                except: print((BW, fplan.loc[VHT_channel].BW))
+            if VHT_channel in fplan.index and VHT_channel>32 and BW_code>0:
+                BW = 80 if BW_code==1 else 160
+                chan = fplan.loc[VHT_channel]
+                freq = chan.Fc
+                if "VHT center freq segment 2" in net:
+                    VHT_channel2 = int(net["VHT center freq segment 2"])
+                    if VHT_channel2 in fplan.index: #implies > 0
+                        chan2 = fplan.loc[VHT_channel2]
+                        if chan2.BW==160:
+                            freq = chan2.Fc
+                            if BW<160:
+                                #dbgprint(f"Error VHT channel width should be >1 (BW==160) : {net}")
+                                BW = 160
+                        elif chan2.BW==80 and chan2.Fc==freq+80:
+                            freq += 40
+                            if BW<160:
+                                #dbgprint(f"Error VHT channel width should be >1 (BW==160) : {net}")
+                                BW = 160
+                        else:
+                            dbgprint(f"Error chan2 not contiguously above chan1 (case not handled yet): {net}") # FIXME: not handled yet
+                            net["Fc2_VHT"] = chan2.Fc
+                            #net["dbg"] += " ___ chan2 not contiguously above chan1"
+                    #else: dbgprint(f'Error fplan.loc[VHT_channel2] : {net}')
                 net["freq_VHT"] = int(freq)
-                net["channel_VHT"] = fplan[fplan.Fc==freq].index[0]
+                #net["channel_VHT"] = fplan[fplan.Fc==freq].index[0]
+                net["Fc"] = net["freq_VHT"]
+            #else: dbgprint(f'Error fplan.loc[VHT_channel] : {net}') #if VHT_channel>=32:
             del net["VHT center freq segment 2"], net["VHT center freq segment 1"], net["VHT channel width"]
         net["chanbw"] = BW
-        if "freq_VHT" in net:
-            net["Fc"] = net["freq_VHT"]
-            net["Channel"] = net["channel_VHT"]
-        elif "freq_40" in net and "channel_40" in net:
-            net["Fc"] = net["freq_40"]
-            net["Channel"] = net["channel_40"]
-        else:
-            net["Fc"] = net["freq_20"]
-            net["Channel"] = net["channel_20"]
+        # if "freq_VHT" in net:
+        #     net["Fc"] = net["freq_VHT"]
+        #     #net["Channel"] = net["channel_VHT"]
+        # elif "freq_40" in net and "channel_40" in net:
+        #     net["Fc"] = net["freq_40"]
+        #     #net["Channel"] = net["channel_40"]
+        # else:
+        #     net["Fc"] = net["freq_20"]
+            #net["Channel"] = net["channel_20"]
     df = pd.DataFrame(wlans)
-    if len(df)==0:
-        print(wlanstr)
-        return None
-    df["fmin"] = df.Fc - df.chanbw//2
-    df["fmax"] = df.Fc + df.chanbw//2
-    df.set_index("ID", inplace=True)
+    if len(df)>0:
+        df["fmin"] = df.Fc - df.chanbw//2
+        df["fmax"] = df.Fc + df.chanbw//2
+        df.set_index("ID", inplace=True)
     return df
 
-from pathlib import Path
 def get_ubnt_wlans(username):
     mycmd = f'''ssh -oHostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=ssh-rsa -i {Path.home()}/.ssh/id_rsa {username}@192.168.1.20 "iwlist ath0 scan"''' # -legacy ?
     wlans = cmd(mycmd)
@@ -239,26 +280,28 @@ def parse_iwlist_scan(wlans):
     return df # wlans,wlan_nets,
 
 def filter_mto(nets):
+    if nets is None or len(nets)==0:
+        return nets
     MTO_MIN = 5600
     MTO_MAX = 5650
     # not (fmax< mto_min or fmin>mto_max) => fmax>= mto_min and fmin<=mto_max
     idx = np.logical_and(nets.fmin<MTO_MAX, nets.fmax>MTO_MIN)
     return nets[idx]
 
-def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None):
-    if len(df)==0:
+def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None, mytime=None):
+    if df is None or len(df)==0:
         return None, None
     if 'Time' in df.columns:
         df.rename(columns={"Time": "time"}, inplace=True)
     if 'time' in df.columns:
         t = df.time.min()
     else:
-        t = int(time())
+        t = int(time()) if mytime is None else mytime
         df["time"] = t
-    if not azimuth in df.columns: df['azimuth'] = azimuth
-    if not lon in df.columns: df['lon'] = lon
-    if not lat in df.columns: df['lat'] = lat
-    df_static_fields = ["MAC", "SSID", "fmin", "fmax", "Fc", "chanbw", "channel_20"] #"ieee_mode", "center1",
+    if not 'azimuth' in df.columns: df['azimuth'] = azimuth
+    if not 'lon' in df.columns: df['lon'] = lon
+    if not 'lat' in df.columns: df['lat'] = lat
+    df_static_fields = ["MAC", "SSID", "fmin", "fmax", "Fc", "chanbw", "channel_20", "dbg", "Fc2_VHT"] #"ieee_mode", "center1",
     df_dyn_fields = ["Signal", "time", "lon", "lat", "azimuth"] # "Quality", "Noise",
     for field in df_static_fields+df_dyn_fields:
         if not field in df.columns:
@@ -267,7 +310,7 @@ def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None):
     df2 = df[df_dyn_fields]
     #df3 = pd.DataFrame({"time": [t], "lon": lon, "lat": lat, "azimuth": azimuth})
 
-    conn = sqlite3.connect(dbfilename)
+    conn = sqlite3.connect(dbfilename) # FIXME: with conn:
     try:
         df1_existing = pd.read_sql("select * from networks", conn)
         for field in df_static_fields:
@@ -287,26 +330,44 @@ def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None):
     #df1_final.to_excel(dbfilename + ".xlsx")
     return df1, df2
 
-def mergedb(db_dest, db2, azimuth=None):
-    conn = sqlite3.connect(db2)
-    df1 = pd.read_sql("select * from networks", conn)
-    df1.set_index('ID', inplace=True)
-    df2 = pd.read_sql("select * from measurements", conn)
-    df2.set_index('ID', inplace=True)
-    df_final = df1.merge(df2, left_index=True, right_index=True)
-    store(df_final, db_dest, azimuth=azimuth)
+# def mergedb(db_dest, db2, azimuth=None):
+#     conn = sqlite3.connect(db2)
+#     df1 = pd.read_sql("select * from networks", conn)
+#     df1.set_index('ID', inplace=True)
+#     df2 = pd.read_sql("select * from measurements", conn)
+#     df2.set_index('ID', inplace=True)
+#     df_final = df1.merge(df2, left_index=True, right_index=True)
+#     store(df_final, db_dest, azimuth=azimuth)
     #try: df3 = pd.read_sql("select * from sessions", conn)
     #except: df3=None
     #if (df3 is None or not any(df3.azimuth)) and azimuth is not None:
     #    print("foo")
     #return df1, df2
 
-#def mergedb(db1, db2):
-#    print((db1, db2))
-#    conn = sqlite3.connect(db1)
-#    cur = conn.cursor()
-#    cur.executescript(f"""attach database '{db2}' as otherdb;
-#                          insert or replace into networks select * from otherdb.networks""")
+def mergedb(db1, db2):
+    print(f"Merging {db2} into {db1}")
+    with sqlite3.connect(args.db) as conn:
+        cur = conn.cursor()
+        cur.executescript(f"""
+             attach database '{db2}' as otherdb;
+             insert or replace into networks select * from otherdb.networks;
+             insert or replace into measurements select * from otherdb.measurements;
+             insert or replace into drivepos select * from otherdb.drivepos;
+         """)
+
+class macoui(): # from https://standards-oui.ieee.org/
+    def __init__(self, filename=None):
+        if filename is None: filename="oui.txt"
+        print("Initializing OUI")
+        ouitxt = open(filename).read()
+        regex = re.compile(r"([0-9A-F-]+)\s+\(hex\)\s+(.+?)\n", re.VERBOSE)
+        matches = regex.findall(ouitxt)
+        self.oui = {match[0]: match[1].strip() for match in matches}
+
+    def getvendor(self, mac):
+        prefix=mac[:8].upper().replace(':','-')
+        return self.oui[prefix] if prefix in self.oui else None
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
