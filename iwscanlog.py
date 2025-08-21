@@ -12,12 +12,15 @@ import re
 from time import time, sleep
 import json
 import argparse
+import sys
+import os
 
 from signal import signal,SIGINT,SIG_IGN
 import subprocess
 from serial import Serial
 from pynmeagps import NMEAReader
 from pathlib import Path
+
 def dbgprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
@@ -34,7 +37,6 @@ class DelayedKeyboardInterrupt:
         if self.signal_received:
             self.old_handler(*self.signal_received)
 
-import os
 def cmd(mycmd, mode=None): # FIXME: issue popen/subprocess iw/iwlist
     """Launches a subcommand while ignoring SIGINT"""
     if mode=="popen":
@@ -69,13 +71,6 @@ def nmea_gps():
             #print(parsed_data)
         return parsed_data.lon, parsed_data.lat
 
-def geodf(df, lon=None, lat=None):
-    if df is None: return None
-    if lon is None or lat is None:
-        return df
-    df['lon'] = lon ; df['lat'] = lat
-    return gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat), crs=4326)
-
 def adb_scan():
     #adb service list
     #https://gist.github.com/nstarke/615ca3603fdded8aee47fab6f4917826
@@ -108,16 +103,16 @@ def wifi_channel_plan(): # FIXME: alert when channel out of range
     df.set_index("channel", inplace=True)
     return df
 
-def iw_scan(iface=None):
+def iw_scan(iface="wlo1"):
     # Preliminary requirement: sudo setcap 'CAP_NET_ADMIN=ep' /sbin/iw
-    #cmd("/sbin/iw dev wlo1 scan flush")
-    if iface is None: iface="wlo1"
-    wlans = cmd(f'/sbin/iw {iface} scan flush')
+    #sys.stderr.write('[') ; sys.stderr.flush()
+    wlans = cmd(f'/sbin/iw {iface} scan flush') # /sbin/iw dev wlo1 scan flush ?
+    #sys.stderr.write(']') ; sys.stderr.flush()
     return wlans
 
 def parse_iw_scan(wlanstr):
     # FIXME: in a future version, use directly RTNETLINK since iw --help says "Do NOT screenscrape this tool, we don't consider its output stable"
-    # Developed and tested on Debian Bookworm
+    # Developed and tested on Debian Bookworm and Trixie
     # FIXME: how to get channel quality (not just signal level) ?
     wlans = []
     HTMODE = 0
@@ -231,8 +226,9 @@ def parse_iw_scan(wlanstr):
     return df
 
 def get_ubnt_wlans(username):
-    mycmd = f'''ssh -oHostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=ssh-rsa -i {Path.home()}/.ssh/id_rsa {username}@192.168.1.20 "iwlist ath0 scan"''' # -legacy ?
-    wlans = cmd(mycmd)
+    athcmds = 'ifconfig ath0 down ; sleep 1 ; ifconfig ath0 up ; sleep 1 ; iwlist ath0 scan'
+    mycmd = f'''ssh -oHostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=ssh-rsa  -o ConnectTimeout=15 -i {Path.home()}/.ssh/id_rsa {username}@192.168.1.20 "{athcmds}"''' # -legacy ?
+    wlans = cmd(mycmd, mode="popen")
     return wlans
 
 def parse_iwlist_scan(wlans):
@@ -266,29 +262,21 @@ def parse_iwlist_scan(wlans):
             elif k=='Frequency':
                 v = int(float(v.replace(" GHz", ""))*1000)
             wlan_nets[-1][k] = v
-    if len(wlan_nets)==0:
-        return None
+    #if len(wlan_nets)==0:
+    #    return None
     df = pd.DataFrame(wlan_nets)
-    df.set_index("ID", inplace=True)
-    if not "Channel" in df.columns:
-        df["Channel"] = None
-    df["fmin"] = df.center1 - df.chanbw//2
-    df["fmax"] = df.center1 + df.chanbw//2
-    df.rename(columns={"center1": "Fc", "ESSID": "SSID", "Frequency": "freq_20", "Channel": "channel_20"}, inplace=True)
-    #df2 = df[['MAC', 'Fc', 'chanbw', 'fmin', 'fmax', 'Time', 'Signal', 'SSID', 'Country', 'Environment', 'Channels', 'channel_20', 'freq_20', 'freq_40', 'channel_40', 'freq_VHT', 'channel_VHT']].copy()
-    #df.Channel = df.Channel.astype(pd.Int16Dtype())
+    if len(df) > 0:
+        df.set_index("ID", inplace=True)
+        if not "Channel" in df.columns:
+            df["Channel"] = None
+        df["fmin"] = df.center1 - df.chanbw//2
+        df["fmax"] = df.center1 + df.chanbw//2
+        df.rename(columns={"center1": "Fc", "ESSID": "SSID", "Frequency": "freq_20", "Channel": "channel_20"}, inplace=True)
+        #df2 = df[['MAC', 'Fc', 'chanbw', 'fmin', 'fmax', 'Time', 'Signal', 'SSID', 'Country', 'Environment', 'Channels', 'channel_20', 'freq_20', 'freq_40', 'channel_40', 'freq_VHT', 'channel_VHT']].copy()
+        #df.Channel = df.Channel.astype(pd.Int16Dtype())
     return df # wlans,wlan_nets,
 
-def filter_mto(nets):
-    if nets is None or len(nets)==0:
-        return nets
-    MTO_MIN = 5600
-    MTO_MAX = 5650
-    # not (fmax< mto_min or fmin>mto_max) => fmax>= mto_min and fmin<=mto_max
-    idx = np.logical_and(nets.fmin<MTO_MAX, nets.fmax>MTO_MIN)
-    return nets[idx]
-
-def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None, mytime=None):
+def store(df, dbfilename="wlans.db", azimuth=None, mytime=None, table_suffix=""):
     if df is None or len(df)==0:
         return None, None
     if 'Time' in df.columns:
@@ -299,9 +287,7 @@ def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None, mytime=No
         t = int(time()) if mytime is None else mytime
         df["time"] = t
     if not 'azimuth' in df.columns: df['azimuth'] = azimuth
-    if not 'lon' in df.columns: df['lon'] = lon
-    if not 'lat' in df.columns: df['lat'] = lat
-    df_static_fields = ["MAC", "SSID", "fmin", "fmax", "Fc", "chanbw", "channel_20", "dbg", "Fc2_VHT"] #"ieee_mode", "center1",
+    df_static_fields = ["MAC", "SSID", "fmin", "fmax", "Fc", "chanbw", "interface"] #"ieee_mode", "center1", "Fc2_VHT", "channel_20", "dbg", 
     df_dyn_fields = ["Signal", "time", "lon", "lat", "azimuth"] # "Quality", "Noise",
     for field in df_static_fields+df_dyn_fields:
         if not field in df.columns:
@@ -312,7 +298,7 @@ def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None, mytime=No
 
     conn = sqlite3.connect(dbfilename) # FIXME: with conn:
     try:
-        df1_existing = pd.read_sql("select * from networks", conn)
+        df1_existing = pd.read_sql(f"select * from networks{table_suffix}", conn)
         for field in df_static_fields:
             if not field in df1_existing.columns:
                 df1_existing[field] = None
@@ -324,8 +310,8 @@ def store(df, dbfilename="wlans.db", azimuth=None, lon=None, lat=None, mytime=No
     except:
         df1_final = df1
         print("create table")
-    df1_final.to_sql('networks', conn, if_exists='append', dtype={'ID': 'INTEGER PRIMARY KEY'}) # replace is for whole table, not per record
-    df2.to_sql('measurements', conn, if_exists='append')
+    df1_final.to_sql(f'networks{table_suffix}', conn, if_exists='append', dtype={'ID': 'INTEGER PRIMARY KEY'}) # replace is for whole table, not per record
+    df2.to_sql(f'measurements{table_suffix}', conn, if_exists='append')
     #df3.to_sql("sessions", conn, if_exists='append')
     #df1_final.to_excel(dbfilename + ".xlsx")
     return df1, df2
@@ -395,15 +381,12 @@ if __name__ == '__main__':
                 pass
             if args.iw:
                 df_iw = parse_iw_scan(iw_scan())
-                if args.gps: df_iw=geodf(df_iw, lon, lat)
                 if args.db: store(df_iw, args.db, azimuth=args.azimuth)
             if args.sshuser is not None:
                 df_ssh = parse_iwlist_scan(get_ubnt_wlans(args.sshuser))
-                if args.gps: df_ssh=geodf(df_ssh, lon, lat)
                 if args.db: store(df_ssh, args.db, azimuth=args.azimuth)
             if args.adb:
                 df_adb = adb_scan()
-                if args.gps: df_adb=geodf(df_adb, lon, lat)
                 if args.db: store(df_adb, args.db, azimuth=args.azimuth)
             if args.print:
                 #print('\033[2J')
